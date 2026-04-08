@@ -1,0 +1,27 @@
+/target/
+
+# Editor/IDE
+/.vscode/
+/.idea/
+*.code-workspace
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs and temp files
+*.log
+*.tmp
+*.swp
+*.swo
+
+# Local notes
+CLAUDE.MD
+.claude
+
+# VS Code extension build artifacts
+/extensions/b-lang-vscode/node_modules/
+/extensions/b-lang-vscode/out/
+/extensions/b-lang-vscode/.vscode-test/
+/extensions/b-lang-vscode/.vscode-test-web/
+/extensions/b-lang-vscode/*.vsix

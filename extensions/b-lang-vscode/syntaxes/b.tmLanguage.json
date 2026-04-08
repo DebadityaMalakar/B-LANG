@@ -1,0 +1,76 @@
+{
+  "scopeName": "source.b",
+  "name": "B",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#chars"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#operators"
+    },
+    {
+      "include": "#identifiers"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.b",
+          "begin": "/\\*",
+          "end": "\\*/"
+        }
+      ]
+    },
+    "strings": {
+      "name": "string.quoted.double.b",
+      "begin": "\"",
+      "end": "\"",
+      "patterns": [
+        {
+          "match": "\\\\\\*.",
+          "name": "constant.character.escape.b"
+        }
+      ]
+    },
+    "chars": {
+      "name": "string.quoted.single.b",
+      "begin": "'",
+      "end": "'",
+      "patterns": [
+        {
+          "match": "\\\\\\*.",
+          "name": "constant.character.escape.b"
+        }
+      ]
+    },
+    "numbers": {
+      "match": "\\b0[0-7]+\\b|\\b\\d+\\b",
+      "name": "constant.numeric.b"
+    },
+    "keywords": {
+      "match": "\\b(auto|extrn|if|else|while|switch|case|default|break|return|goto)\\b",
+      "name": "keyword.control.b"
+    },
+    "operators": {
+      "match": "\\+\\+|--|<<=|>>=|<=|>=|==|!=|<<|>>|\\+=|-=|\\*=|/=|%=|&=|\\|=|\\^=|&&|\\|\\||[+\\-*/%<>=!&|^~?:]",
+      "name": "keyword.operator.b"
+    },
+    "identifiers": {
+      "match": "\\b[_A-Za-z][_A-Za-z0-9]*\\b",
+      "name": "identifier.b"
+    }
+  }
+}
