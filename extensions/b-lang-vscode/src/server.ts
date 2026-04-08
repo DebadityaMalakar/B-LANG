@@ -28,6 +28,66 @@ const keywords = new Map<string, string>([
   ["goto", "Jump to label."],
 ]);
 
+const builtinFunctions = new Map<string, { signature: string; description: string }>([
+  ["getchar", { signature: "getchar()", description: "Read one character from input and return its code." }],
+  ["putchar", { signature: "putchar(c)", description: "Write one character; returns the value written." }],
+  ["putnumbs", { signature: "putnumbs(n)", description: "Print a decimal integer." }],
+  ["printf", { signature: "printf(fmt, ...)", description: "Formatted output (supports %d, %o, %c, %s)." }],
+  ["getstr", { signature: "getstr(s)", description: "Read a line into vector s and append \"*e\" terminator." }],
+  ["putstr", { signature: "putstr(s)", description: "Write characters from vector s until terminator." }],
+  ["openr", { signature: "openr(u, s)", description: "Open input unit u from filename s (MVP may be stubbed)." }],
+  ["openw", { signature: "openw(u, s)", description: "Open output unit u to filename s (MVP may be stubbed)." }],
+  ["flush", { signature: "flush()", description: "Flush output buffers (MVP may be stubbed)." }],
+  ["reread", { signature: "reread()", description: "Reset input stream (MVP may be stubbed)." }],
+  ["system", { signature: "system(s)", description: "Execute a system command string (MVP may be stubbed)." }],
+  ["char", { signature: "char(s, n)", description: "Return the n-th character of vector s." }],
+  ["lchar", { signature: "lchar(s, n, c)", description: "Set the n-th character of vector s and return c." }],
+  ["concat", { signature: "concat(a, b1, ..., b10)", description: "Concatenate strings into vector a." }],
+  ["getarg", { signature: "getarg(n)", description: "Return the n-th command line argument." }],
+  ["getvec", { signature: "getvec(n)", description: "Allocate a vector of size n and return its address." }],
+  ["rlsvec", { signature: "rlsvec(v)", description: "Release a vector previously allocated with getvec." }],
+  ["exit", { signature: "exit()", description: "Terminate execution." }],
+  ["nargs", { signature: "nargs()", description: "Return number of arguments to current function." }]
+]);
+
+const operatorDocs = new Map<string, string>([
+  ["+", "Addition."],
+  ["-", "Subtraction or unary negation."],
+  ["*", "Multiplication or indirection (dereference)."],
+  ["/", "Division."],
+  ["%", "Remainder."],
+  ["<<", "Left shift."],
+  [">>", "Right shift."],
+  ["<", "Less-than comparison."],
+  ["<=", "Less-than or equal comparison."],
+  [">", "Greater-than comparison."],
+  [">=", "Greater-than or equal comparison."],
+  ["==", "Equality comparison."],
+  ["!=", "Inequality comparison."],
+  ["&", "Bitwise AND or address-of."],
+  ["|", "Bitwise OR."],
+  ["^", "Bitwise XOR."],
+  ["~", "Bitwise NOT."],
+  ["!", "Logical NOT."],
+  ["&&", "Logical AND (short-circuit)."],
+  ["||", "Logical OR (short-circuit)."],
+  ["=", "Assignment."],
+  ["+=", "Add and assign."],
+  ["-=", "Subtract and assign."],
+  ["*=", "Multiply and assign."],
+  ["/=", "Divide and assign."],
+  ["%=", "Remainder and assign."],
+  ["<<=", "Left shift and assign."],
+  [">>=", "Right shift and assign."],
+  ["&=", "Bitwise AND and assign."],
+  ["|=", "Bitwise OR and assign."],
+  ["^=", "Bitwise XOR and assign."],
+  ["++", "Increment."],
+  ["--", "Decrement."],
+  ["?", "Conditional operator (ternary)."],
+  [":", "Conditional operator separator."]
+]);
+
 connection.onInitialize(() => {
   return {
     capabilities: {
@@ -51,20 +111,45 @@ connection.onHover((params): Hover | null => {
   if (!doc) {
     return null;
   }
-  const word = getWordAtPosition(doc, params.position.line, params.position.character);
-  if (!word) {
+  const text = doc.getText();
+  const { tokens } = lex(text);
+  const token = getTokenAtPosition(tokens, params.position.line, params.position.character);
+  if (!token) {
     return null;
   }
-  const info = keywords.get(word);
-  if (!info) {
-    return null;
-  }
-  return {
-    contents: {
-      kind: "markdown",
-      value: `**${word}**\n\n${info}`
+
+  if (token.type === "ident") {
+    const keywordInfo = keywords.get(token.value);
+    if (keywordInfo) {
+      return buildHover(`**${token.value}**`, [`Keyword - ${keywordInfo}`]);
     }
-  };
+
+    const builtinInfo = builtinFunctions.get(token.value);
+    if (builtinInfo) {
+      return buildHover(`**${token.value}**`, ["Builtin function.", `\`${builtinInfo.signature}\``, builtinInfo.description]);
+    }
+
+    const topLevel = collectTopLevelKinds(tokens).get(token.value);
+    if (topLevel) {
+      return buildHover(`**${token.value}**`, [formatSymbolKind(topLevel)]);
+    }
+
+    return null;
+  }
+
+  if (token.type === "number") {
+    const info = describeNumberLiteral(token.value);
+    return info ? buildHover(`\`${token.value}\``, info) : null;
+  }
+
+  if (token.type === "symbol") {
+    const opInfo = operatorDocs.get(token.value);
+    if (opInfo) {
+      return buildHover(`\`${token.value}\``, [opInfo]);
+    }
+  }
+
+  return null;
 });
 
 connection.onDocumentSymbol((params): DocumentSymbol[] => {
@@ -341,21 +426,50 @@ function isDigit(ch: string): boolean {
   return /[0-9]/.test(ch);
 }
 
-function getWordAtPosition(doc: TextDocument, line: number, character: number): string | null {
-  const text = doc.getText();
-  const offset = doc.offsetAt({ line, character });
-  const before = text.slice(0, offset);
-  const after = text.slice(offset);
-  const beforeMatch = before.match(/[A-Za-z_][A-Za-z0-9_]*$/);
-  const afterMatch = after.match(/^[A-Za-z0-9_]*/);
-  if (!beforeMatch) {
+function buildHover(title: string, lines: string[]): Hover {
+  return {
+    contents: {
+      kind: "markdown",
+      value: [title, "", ...lines].join("\n")
+    }
+  };
+}
+
+function getTokenAtPosition(tokens: Token[], line: number, character: number): Token | null {
+  for (const token of tokens) {
+    if (token.line !== line) {
+      continue;
+    }
+    const end = token.character + token.value.length;
+    if (character >= token.character && character < end) {
+      return token;
+    }
+  }
+  return null;
+}
+
+function describeNumberLiteral(value: string): string[] | null {
+  if (!/^\d+$/.test(value)) {
     return null;
   }
-  return beforeMatch[0] + (afterMatch ? afterMatch[0] : "");
+  if (value.length > 1 && value.startsWith("0")) {
+    if (/^0[0-7]+$/.test(value)) {
+      const decValue = Number.parseInt(value, 8);
+      return ["Octal literal.", `Value: ${decValue} (decimal).`];
+    }
+    return ["Octal literal (invalid digits).", "B treats leading zero as octal; digits must be 0-7."];
+  }
+
+  const decValue = Number.parseInt(value, 10);
+  return ["Decimal literal.", `Value: ${decValue}.`, `Octal: ${decValue.toString(8)}.`];
 }
 
 function collectSymbols(text: string): DocumentSymbol[] {
   const { tokens } = lex(text);
+  return collectSymbolsFromTokens(tokens);
+}
+
+function collectSymbolsFromTokens(tokens: Token[]): DocumentSymbol[] {
   const symbols: DocumentSymbol[] = [];
   let braceDepth = 0;
 
@@ -390,6 +504,51 @@ function collectSymbols(text: string): DocumentSymbol[] {
   }
 
   return symbols;
+}
+
+function collectTopLevelKinds(tokens: Token[]): Map<string, SymbolKind> {
+  const kinds = new Map<string, SymbolKind>();
+  let braceDepth = 0;
+
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token.type === "symbol") {
+      if (token.value === "{") {
+        braceDepth += 1;
+      } else if (token.value === "}") {
+        braceDepth = Math.max(0, braceDepth - 1);
+      }
+      continue;
+    }
+
+    if (braceDepth !== 0 || token.type !== "ident") {
+      continue;
+    }
+
+    const next = tokens[i + 1];
+    if (!next || next.type !== "symbol") {
+      continue;
+    }
+
+    if (next.value === "(") {
+      kinds.set(token.value, SymbolKind.Function);
+    } else if (next.value === ";" || next.value === "[") {
+      kinds.set(token.value, SymbolKind.Variable);
+    }
+  }
+
+  return kinds;
+}
+
+function formatSymbolKind(kind: SymbolKind): string {
+  switch (kind) {
+    case SymbolKind.Function:
+      return "Function declaration.";
+    case SymbolKind.Variable:
+      return "Global variable declaration.";
+    default:
+      return "Symbol declaration.";
+  }
 }
 
 function toSymbol(token: Token, kind: SymbolKind): DocumentSymbol {

@@ -18,6 +18,7 @@ Thumbs.db
 # Local notes
 CLAUDE.MD
 .claude
+*CLAUDE.*
 
 # VS Code extension build artifacts
 /extensions/b-lang-vscode/node_modules/

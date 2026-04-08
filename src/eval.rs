@@ -2,7 +2,8 @@ use crate::ast::{BinaryOp, Expr, Function, Program, Stmt, UnaryOp};
 use crate::builtins::STRING_TERMINATOR;
 use crate::error::RuntimeError;
 use crate::memory::{
-    add_offset, decode_address, encode_global, encode_local, Address, BValue, Frame, GlobalMemory,
+    add_offset, decode_address, encode_global, encode_heap, encode_local, Address, BValue, Frame,
+    GlobalMemory, Heap,
 };
 use crate::symbol::{GlobalSymbol, LocalLayout, LocalSymbol};
 use std::collections::HashMap;
@@ -45,6 +46,7 @@ impl OutputSink {
 
 pub struct Interpreter {
     globals: GlobalMemory,
+    heap: Heap,
     global_symbols: HashMap<String, GlobalSymbol>,
     functions: HashMap<String, Function>,
     local_layouts: HashMap<String, LocalLayout>,
@@ -52,6 +54,7 @@ pub struct Interpreter {
     input: Box<dyn BufRead>,
     output: OutputSink,
     string_pool: HashMap<String, i64>,
+    debug_memory: bool,
 }
 
 impl Interpreter {
@@ -62,7 +65,7 @@ impl Interpreter {
     }
 
     pub fn with_io(program: Program, input: Box<dyn BufRead>, output: OutputSink) -> Self {
-        let (globals, global_symbols) = Self::init_globals(&program);
+        let (globals, heap, global_symbols) = Self::init_globals(&program);
         let functions = program
             .functions
             .iter()
@@ -77,6 +80,7 @@ impl Interpreter {
 
         Self {
             globals,
+            heap,
             global_symbols,
             functions,
             local_layouts,
@@ -84,11 +88,16 @@ impl Interpreter {
             input,
             output,
             string_pool: HashMap::new(),
+            debug_memory: false,
         }
     }
 
     pub fn set_output(&mut self, output: OutputSink) {
         self.output = output;
+    }
+
+    pub fn set_debug_memory(&mut self, enabled: bool) {
+        self.debug_memory = enabled;
     }
 
     pub fn run_main(&mut self) -> Result<BValue, RuntimeError> {
@@ -103,9 +112,54 @@ impl Interpreter {
         self.output.take_buffer()
     }
 
-    fn init_globals(program: &Program) -> (GlobalMemory, HashMap<String, GlobalSymbol>) {
+    // -------------------------------------------------------------------------
+    // Debug utilities
+    // -------------------------------------------------------------------------
+
+    pub fn dump_heap(&self) {
+        eprintln!("=== HEAP DUMP ({} slots) ===", self.heap.data.len());
+        for (i, val) in self.heap.data.iter().enumerate() {
+            let ch = if val.0 >= 0x20 && val.0 <= 0x7e {
+                val.0 as u8 as char
+            } else {
+                '.'
+            };
+            eprintln!("  heap[{:4}] = {:10}  '{}'", i, val.0, ch);
+        }
+    }
+
+    pub fn dump_stack(&self) {
+        eprintln!("=== STACK DUMP ({} frames) ===", self.frames.len());
+        for (fi, frame) in self.frames.iter().enumerate() {
+            eprintln!(
+                "  frame[{}] {} (nargs={}, bp={}, {} locals):",
+                fi,
+                frame.func,
+                frame.nargs,
+                frame.base_pointer,
+                frame.locals.len()
+            );
+            for (i, val) in frame.locals.iter().enumerate() {
+                eprintln!("    local[{:3}] = {}", i, val.0);
+            }
+        }
+    }
+
+    pub fn trace_exec(&self, msg: &str) {
+        eprintln!("[TRACE] {}", msg);
+    }
+
+    // -------------------------------------------------------------------------
+    // Initialization
+    // -------------------------------------------------------------------------
+
+    /// Allocates global variable slots and pre-allocates global vectors in the
+    /// heap. Returns the global segment, heap segment, and symbol table.
+    fn init_globals(program: &Program) -> (GlobalMemory, Heap, HashMap<String, GlobalSymbol>) {
         let mut globals = GlobalMemory::new();
+        let mut heap = Heap::new();
         let mut symbols = HashMap::new();
+
         for decl in &program.globals {
             let slot = globals.allocate_block(1);
             let mut symbol = GlobalSymbol {
@@ -114,15 +168,19 @@ impl Interpreter {
                 vector_base: None,
             };
             if let Some(size) = decl.vector_size {
-                let base = globals.allocate_block(size + 1);
-                globals.data[slot] = BValue(encode_global(base));
+                let base = heap.allocate(size + 1);
+                globals.data[slot] = BValue(encode_heap(base));
                 symbol.vector_base = Some(base);
             }
             symbols.insert(decl.name.clone(), symbol);
         }
-        (globals, symbols)
+
+        (globals, heap, symbols)
     }
 
+    /// Computes the static layout for a function's local frame.
+    /// Auto vectors are NOT allocated here — they are allocated in the heap at
+    /// call time. We only record each variable's slot index and size.
     fn build_local_layout(function: &Function) -> LocalLayout {
         let mut symbols = HashMap::new();
         let mut total_slots = 0;
@@ -133,7 +191,7 @@ impl Interpreter {
                 LocalSymbol {
                     slot: total_slots,
                     is_vector: false,
-                    vector_base: None,
+                    vector_size: None,
                 },
             );
             total_slots += 1;
@@ -142,12 +200,8 @@ impl Interpreter {
         for local in &function.locals {
             let slot = total_slots;
             total_slots += 1;
-            let (is_vector, vector_base) = match local.vector_size {
-                Some(size) => {
-                    let base = total_slots;
-                    total_slots += size + 1;
-                    (true, Some(base))
-                }
+            let (is_vector, vector_size) = match local.vector_size {
+                Some(size) => (true, Some(size)),
                 None => (false, None),
             };
             symbols.insert(
@@ -155,7 +209,7 @@ impl Interpreter {
                 LocalSymbol {
                     slot,
                     is_vector,
-                    vector_base,
+                    vector_size,
                 },
             );
         }
@@ -165,6 +219,10 @@ impl Interpreter {
             total_slots,
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Function calls
+    // -------------------------------------------------------------------------
 
     fn call_function(&mut self, name: &str, args: Vec<BValue>) -> Result<BValue, RuntimeError> {
         if let Some(value) = self.call_builtin(name, &args)? {
@@ -182,24 +240,37 @@ impl Interpreter {
             .ok_or_else(|| RuntimeError::message("missing layout"))?
             .clone();
 
+        let base_pointer = self.frames.len();
         let mut frame = Frame {
             func: name.to_string(),
             locals: vec![BValue(0); layout.total_slots],
             nargs: args.len(),
+            base_pointer,
         };
 
+        // Bind parameters.
         for (idx, param) in function.params.iter().enumerate() {
             if let Some(symbol) = layout.symbols.get(param) {
                 frame.locals[symbol.slot] = args.get(idx).copied().unwrap_or(BValue(0));
             }
         }
 
+        // Allocate auto vectors in the heap; store heap address in the local slot.
         for symbol in layout.symbols.values() {
             if symbol.is_vector {
-                if let Some(base) = symbol.vector_base {
-                    frame.locals[symbol.slot] = BValue(encode_local(base));
-                }
+                let size = symbol.vector_size.unwrap_or(0);
+                let base = self.heap.allocate(size + 1);
+                frame.locals[symbol.slot] = BValue(encode_heap(base));
             }
+        }
+
+        if self.debug_memory {
+            eprintln!(
+                "[DEBUG] call {} (nargs={}, frame_depth={})",
+                name,
+                args.len(),
+                base_pointer
+            );
         }
 
         self.frames.push(frame);
@@ -216,6 +287,10 @@ impl Interpreter {
             ))),
         }
     }
+
+    // -------------------------------------------------------------------------
+    // Statement execution
+    // -------------------------------------------------------------------------
 
     fn exec_stmt(&mut self, stmt: &Stmt) -> Result<ControlFlow, RuntimeError> {
         match stmt {
@@ -341,6 +416,10 @@ impl Interpreter {
         }
         Ok(ControlFlow::Next)
     }
+
+    // -------------------------------------------------------------------------
+    // Expression evaluation
+    // -------------------------------------------------------------------------
 
     fn eval_expr(&mut self, expr: &Expr) -> Result<BValue, RuntimeError> {
         match expr {
@@ -479,48 +558,12 @@ impl Interpreter {
             }
             BinaryOp::LShift => lhs << rhs,
             BinaryOp::RShift => lhs >> rhs,
-            BinaryOp::Lt => {
-                if lhs < rhs {
-                    1
-                } else {
-                    0
-                }
-            }
-            BinaryOp::Le => {
-                if lhs <= rhs {
-                    1
-                } else {
-                    0
-                }
-            }
-            BinaryOp::Gt => {
-                if lhs > rhs {
-                    1
-                } else {
-                    0
-                }
-            }
-            BinaryOp::Ge => {
-                if lhs >= rhs {
-                    1
-                } else {
-                    0
-                }
-            }
-            BinaryOp::Eq => {
-                if lhs == rhs {
-                    1
-                } else {
-                    0
-                }
-            }
-            BinaryOp::Ne => {
-                if lhs != rhs {
-                    1
-                } else {
-                    0
-                }
-            }
+            BinaryOp::Lt => (lhs < rhs) as i64,
+            BinaryOp::Le => (lhs <= rhs) as i64,
+            BinaryOp::Gt => (lhs > rhs) as i64,
+            BinaryOp::Ge => (lhs >= rhs) as i64,
+            BinaryOp::Eq => (lhs == rhs) as i64,
+            BinaryOp::Ne => (lhs != rhs) as i64,
             BinaryOp::BitAnd => lhs & rhs,
             BinaryOp::BitXor => lhs ^ rhs,
             BinaryOp::BitOr => lhs | rhs,
@@ -528,6 +571,10 @@ impl Interpreter {
         };
         Ok(result)
     }
+
+    // -------------------------------------------------------------------------
+    // Address helpers
+    // -------------------------------------------------------------------------
 
     fn lvalue_address(&mut self, expr: &Expr) -> Result<i64, RuntimeError> {
         match expr {
@@ -543,6 +590,7 @@ impl Interpreter {
     }
 
     fn resolve_var_address(&mut self, name: &str) -> Result<i64, RuntimeError> {
+        // Check current frame's local layout first.
         if let Some(frame) = self.frames.last() {
             if let Some(layout) = self.local_layouts.get(&frame.func) {
                 if let Some(symbol) = layout.symbols.get(name) {
@@ -571,9 +619,16 @@ impl Interpreter {
         slot
     }
 
+    // -------------------------------------------------------------------------
+    // Unified memory read / write layer
+    // -------------------------------------------------------------------------
+
     fn load_address(&mut self, addr: i64) -> Result<BValue, RuntimeError> {
         if addr < 0 {
-            return Err(RuntimeError::message("invalid address"));
+            return Err(RuntimeError::message(format!(
+                "invalid address: {}",
+                addr
+            )));
         }
         match decode_address(addr) {
             Address::Local(index) => {
@@ -581,26 +636,33 @@ impl Interpreter {
                     .frames
                     .last()
                     .ok_or_else(|| RuntimeError::message("no frame"))?;
-                let value = frame
+                frame
                     .locals
                     .get(index)
-                    .ok_or_else(|| RuntimeError::message("local address out of range"))?;
-                Ok(*value)
+                    .copied()
+                    .ok_or_else(|| RuntimeError::message("local address out of range"))
             }
-            Address::Global(index) => {
-                let value = self
-                    .globals
-                    .data
-                    .get(index)
-                    .ok_or_else(|| RuntimeError::message("global address out of range"))?;
-                Ok(*value)
-            }
+            Address::Heap(index) => self
+                .heap
+                .data
+                .get(index)
+                .copied()
+                .ok_or_else(|| RuntimeError::message("heap address out of range")),
+            Address::Global(index) => self
+                .globals
+                .data
+                .get(index)
+                .copied()
+                .ok_or_else(|| RuntimeError::message("global address out of range")),
         }
     }
 
     fn store_address(&mut self, addr: i64, value: BValue) -> Result<(), RuntimeError> {
         if addr < 0 {
-            return Err(RuntimeError::message("invalid address"));
+            return Err(RuntimeError::message(format!(
+                "invalid address: {}",
+                addr
+            )));
         }
         match decode_address(addr) {
             Address::Local(index) => {
@@ -612,6 +674,15 @@ impl Interpreter {
                     .locals
                     .get_mut(index)
                     .ok_or_else(|| RuntimeError::message("local address out of range"))?;
+                *slot = value;
+                Ok(())
+            }
+            Address::Heap(index) => {
+                let slot = self
+                    .heap
+                    .data
+                    .get_mut(index)
+                    .ok_or_else(|| RuntimeError::message("heap address out of range"))?;
                 *slot = value;
                 Ok(())
             }
@@ -627,20 +698,27 @@ impl Interpreter {
         }
     }
 
+    // -------------------------------------------------------------------------
+    // String interning — literals are stored in the heap
+    // -------------------------------------------------------------------------
+
     fn intern_string(&mut self, value: &str) -> Result<i64, RuntimeError> {
         if let Some(addr) = self.string_pool.get(value) {
             return Ok(*addr);
         }
-
-        let base = self.globals.allocate_block(value.len() + 1);
+        let base = self.heap.allocate(value.len() + 1);
         for (idx, byte) in value.bytes().enumerate() {
-            self.globals.data[base + idx] = BValue(byte as i64);
+            self.heap.data[base + idx] = BValue(byte as i64);
         }
-        self.globals.data[base + value.len()] = BValue(STRING_TERMINATOR);
-        let addr = encode_global(base);
+        self.heap.data[base + value.len()] = BValue(STRING_TERMINATOR);
+        let addr = encode_heap(base);
         self.string_pool.insert(value.to_string(), addr);
         Ok(addr)
     }
+
+    // -------------------------------------------------------------------------
+    // Built-in functions
+    // -------------------------------------------------------------------------
 
     fn call_builtin(&mut self, name: &str, args: &[BValue]) -> Result<Option<BValue>, RuntimeError> {
         match name {
@@ -662,8 +740,7 @@ impl Interpreter {
             }
             "putnumbs" => {
                 let value = args.get(0).copied().unwrap_or(BValue(0)).as_i64();
-                self.output
-                    .write_all(value.to_string().as_bytes())?;
+                self.output.write_all(value.to_string().as_bytes())?;
                 Ok(Some(BValue(value)))
             }
             "printf" => {
@@ -681,7 +758,6 @@ impl Interpreter {
                         output.push(ch);
                         continue;
                     }
-
                     match iter.next() {
                         Some(b'%') => output.push(b'%'),
                         Some(b'd') => {
@@ -692,7 +768,9 @@ impl Interpreter {
                         Some(b'o') => {
                             let value = args.get(arg_index).copied().unwrap_or(BValue(0));
                             arg_index += 1;
-                            output.extend_from_slice(format!("{:o}", value.as_i64()).as_bytes());
+                            output.extend_from_slice(
+                                format!("{:o}", value.as_i64()).as_bytes(),
+                            );
                         }
                         Some(b'c') => {
                             let value = args.get(arg_index).copied().unwrap_or(BValue(0));
@@ -751,7 +829,7 @@ impl Interpreter {
             }
             "concat" => {
                 let dest = args.get(0).copied().unwrap_or(BValue(0)).as_i64();
-                let mut offset = 0;
+                let mut offset = 0i64;
                 for arg in args.iter().skip(1) {
                     let addr = arg.as_i64();
                     let bytes = self.read_c_string(addr)?;
@@ -763,20 +841,31 @@ impl Interpreter {
                 self.store_address(add_offset(dest, offset), BValue(STRING_TERMINATOR))?;
                 Ok(Some(BValue(dest)))
             }
+            "getvec" => {
+                // Allocate a heap vector of the requested size; return base address.
+                let size = args.get(0).copied().unwrap_or(BValue(0)).as_i64() as usize;
+                let base = self.heap.allocate(size + 1);
+                Ok(Some(BValue(encode_heap(base))))
+            }
+            "rlsvec" => {
+                // Bump allocator; release is a no-op for MVP.
+                Ok(Some(BValue(0)))
+            }
             "nargs" => {
                 let count = self.frames.last().map(|f| f.nargs).unwrap_or(0);
                 Ok(Some(BValue(count as i64)))
             }
             "exit" => Err(RuntimeError::Exit(0)),
-            "openr" | "openw" | "flush" | "reread" | "system" | "getarg" | "getvec"
-            | "rlsvec" => Ok(Some(BValue(0))),
+            "openr" | "openw" | "flush" | "reread" | "system" | "getarg" => {
+                Ok(Some(BValue(0)))
+            }
             _ => Ok(None),
         }
     }
 
     fn read_c_string(&mut self, addr: i64) -> Result<Vec<u8>, RuntimeError> {
         let mut bytes = Vec::new();
-        let mut offset = 0;
+        let mut offset = 0i64;
         loop {
             let value = self.load_address(add_offset(addr, offset))?.as_i64();
             if value == STRING_TERMINATOR {
