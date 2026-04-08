@@ -69,7 +69,7 @@ Open the extension folder in VS Code and launch the "Run Extension" debug target
 - VS Code extension: MIT (see [extensions/b-lang-vscode/LICENSE](extensions/b-lang-vscode/LICENSE))
 
 ## Code Statistics
-```
+```bash
 	 10 text files.
 	 10 unique files.
 	  0 files ignored.
