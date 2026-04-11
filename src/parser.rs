@@ -26,10 +26,17 @@ impl Parser {
     }
 
     fn parse_program(&mut self) -> Result<Program, Error> {
+        let mut includes = Vec::new();
         let mut globals = Vec::new();
         let mut functions = Vec::new();
 
         while !self.is_eof() {
+            if self.match_keyword(Keyword::Include) {
+                let name = self.expect_ident()?;
+                includes.push(name);
+                continue;
+            }
+
             if self.match_keyword(Keyword::Extrn) {
                 self.parse_extrn_decl(&mut globals)?;
                 continue;
@@ -45,7 +52,7 @@ impl Parser {
             }
         }
 
-        Ok(Program { globals, functions })
+        Ok(Program { includes, globals, functions })
     }
 
     fn parse_global_decl(&mut self, name: String) -> Result<GlobalDecl, Error> {
@@ -141,6 +148,10 @@ impl Parser {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt, Error> {
+        if self.check_keyword(Keyword::Include) {
+            return Err(self.error_here("'include' is not valid inside a function body"));
+        }
+
         if self.match_symbol(Symbol::LBrace) {
             self.index -= 1;
             return self.parse_compound();

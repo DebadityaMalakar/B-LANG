@@ -3,6 +3,8 @@ pub mod builtins;
 pub mod error;
 pub mod eval;
 pub mod lexer;
+pub mod libraries;
+pub mod math;
 pub mod memory;
 pub mod parser;
 pub mod symbol;

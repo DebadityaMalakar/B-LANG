@@ -13,6 +13,7 @@ pub enum Keyword {
     Break,
     Return,
     Goto,
+    Include,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -137,6 +138,7 @@ impl Lexer {
                 "break" => TokenKind::Keyword(Keyword::Break),
                 "return" => TokenKind::Keyword(Keyword::Return),
                 "goto" => TokenKind::Keyword(Keyword::Goto),
+                "include" => TokenKind::Keyword(Keyword::Include),
                 _ => TokenKind::Ident(ident),
             };
             return Ok(Token { kind, location });

@@ -1,5 +1,8 @@
 #[derive(Clone, Debug)]
 pub struct Program {
+    /// Library names requested via `include <name>` at the top level.
+    /// Resolved by the interpreter before `main` is called.
+    pub includes: Vec<String>,
     pub globals: Vec<GlobalDecl>,
     pub functions: Vec<Function>,
 }
