@@ -1,6 +1,8 @@
 use crate::ast::{BinaryOp, Expr, Function, Program, Stmt, UnaryOp};
 use crate::builtins::STRING_TERMINATOR;
 use crate::error::RuntimeError;
+use crate::libraries::resolve_include;
+use crate::math::MathFn;
 use crate::memory::{
     add_offset, decode_address, encode_global, encode_heap, encode_local, Address, BValue, Frame,
     GlobalMemory, Heap,
@@ -8,6 +10,16 @@ use crate::memory::{
 use crate::symbol::{GlobalSymbol, LocalLayout, LocalSymbol};
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufWriter, Read, Write};
+
+/// Maximum call-stack depth before `StackOverflow` is raised.
+/// Each B-language frame corresponds to one level of Rust recursion through
+/// call_function → exec_stmt → eval_expr, so this value also guards against
+/// native-stack overflow in the tree-walking interpreter.
+const MAX_STACK_DEPTH: usize = 128;
+
+// ---------------------------------------------------------------------------
+// Output sink
+// ---------------------------------------------------------------------------
 
 pub enum OutputSink {
     Stdout(BufWriter<io::Stdout>),
@@ -19,7 +31,7 @@ impl OutputSink {
         match self {
             OutputSink::Stdout(writer) => writer
                 .write_all(bytes)
-                .map_err(|err| RuntimeError::message(err.to_string())),
+                .map_err(|e| RuntimeError::message(e.to_string())),
             OutputSink::Buffer(buffer) => {
                 buffer.extend_from_slice(bytes);
                 Ok(())
@@ -31,7 +43,7 @@ impl OutputSink {
         match self {
             OutputSink::Stdout(writer) => writer
                 .flush()
-                .map_err(|err| RuntimeError::message(err.to_string())),
+                .map_err(|e| RuntimeError::message(e.to_string())),
             OutputSink::Buffer(_) => Ok(()),
         }
     }
@@ -44,6 +56,10 @@ impl OutputSink {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Interpreter
+// ---------------------------------------------------------------------------
+
 pub struct Interpreter {
     globals: GlobalMemory,
     heap: Heap,
@@ -54,7 +70,18 @@ pub struct Interpreter {
     input: Box<dyn BufRead>,
     output: OutputSink,
     string_pool: HashMap<String, i64>,
+    /// Registry of math (and future library) builtins populated by `include`.
+    math_registry: HashMap<String, MathFn>,
+    /// Deferred error from a failed `include` resolution; surfaced in run_main.
+    include_error: Option<RuntimeError>,
+    /// Emit heap/stack dumps and memory access warnings.
     debug_memory: bool,
+    /// Trace every function call, return, and goto to stderr.
+    trace_exec: bool,
+    /// Log every memory read/write to stderr (pointer tracing).
+    strict_memory: bool,
+    /// Warn to stderr on math domain errors (sqrt(-1), ln(0), etc.).
+    strict_math: bool,
 }
 
 impl Interpreter {
@@ -70,13 +97,24 @@ impl Interpreter {
             .functions
             .iter()
             .cloned()
-            .map(|func| (func.name.clone(), func))
+            .map(|f| (f.name.clone(), f))
             .collect();
         let local_layouts = program
             .functions
             .iter()
-            .map(|func| (func.name.clone(), Self::build_local_layout(func)))
+            .map(|f| (f.name.clone(), Self::build_local_layout(f)))
             .collect();
+
+        // Resolve includes — build the math registry in source order.
+        // An unknown library name captures an error to surface in run_main.
+        let mut math_registry: HashMap<String, MathFn> = HashMap::new();
+        let mut include_error: Option<RuntimeError> = None;
+        for lib_name in &program.includes {
+            if let Err(e) = resolve_include(lib_name, &mut math_registry) {
+                include_error = Some(e);
+                break;
+            }
+        }
 
         Self {
             globals,
@@ -88,9 +126,16 @@ impl Interpreter {
             input,
             output,
             string_pool: HashMap::new(),
+            math_registry,
+            include_error,
             debug_memory: false,
+            trace_exec: false,
+            strict_memory: false,
+            strict_math: false,
         }
     }
+
+    // -- configuration -------------------------------------------------------
 
     pub fn set_output(&mut self, output: OutputSink) {
         self.output = output;
@@ -100,7 +145,25 @@ impl Interpreter {
         self.debug_memory = enabled;
     }
 
+    pub fn set_trace_exec(&mut self, enabled: bool) {
+        self.trace_exec = enabled;
+    }
+
+    pub fn set_strict_memory(&mut self, enabled: bool) {
+        self.strict_memory = enabled;
+    }
+
+    pub fn set_strict_math(&mut self, enabled: bool) {
+        self.strict_math = enabled;
+    }
+
+    // -- entry point ---------------------------------------------------------
+
     pub fn run_main(&mut self) -> Result<BValue, RuntimeError> {
+        // Surface any include-resolution error before executing main.
+        if let Some(err) = self.include_error.take() {
+            return Err(err);
+        }
         match self.call_function("main", Vec::new()) {
             Ok(value) => Ok(value),
             Err(RuntimeError::Exit(code)) => Ok(BValue(code)),
@@ -145,16 +208,28 @@ impl Interpreter {
         }
     }
 
-    pub fn trace_exec(&self, msg: &str) {
+    fn trace(&self, msg: &str) {
         eprintln!("[TRACE] {}", msg);
+    }
+
+    fn mem_trace(&self, op: &str, addr: i64, val: BValue) {
+        let decoded = match decode_address(addr) {
+            Address::Global(i) => format!("global[{}]", i),
+            Address::Local(i) => format!("local[{}]", i),
+            Address::Heap(i) => format!("heap[{}]", i),
+        };
+        let ch = if val.0 >= 0x20 && val.0 <= 0x7e {
+            format!(" '{}'", val.0 as u8 as char)
+        } else {
+            String::new()
+        };
+        eprintln!("[MEM] {} addr=0x{:x} ({}) = {}{}", op, addr, decoded, val.0, ch);
     }
 
     // -------------------------------------------------------------------------
     // Initialization
     // -------------------------------------------------------------------------
 
-    /// Allocates global variable slots and pre-allocates global vectors in the
-    /// heap. Returns the global segment, heap segment, and symbol table.
     fn init_globals(program: &Program) -> (GlobalMemory, Heap, HashMap<String, GlobalSymbol>) {
         let mut globals = GlobalMemory::new();
         let mut heap = Heap::new();
@@ -178,9 +253,6 @@ impl Interpreter {
         (globals, heap, symbols)
     }
 
-    /// Computes the static layout for a function's local frame.
-    /// Auto vectors are NOT allocated here — they are allocated in the heap at
-    /// call time. We only record each variable's slot index and size.
     fn build_local_layout(function: &Function) -> LocalLayout {
         let mut symbols = HashMap::new();
         let mut total_slots = 0;
@@ -225,6 +297,11 @@ impl Interpreter {
     // -------------------------------------------------------------------------
 
     fn call_function(&mut self, name: &str, args: Vec<BValue>) -> Result<BValue, RuntimeError> {
+        // Check stack depth before pushing a new frame.
+        if self.frames.len() >= MAX_STACK_DEPTH {
+            return Err(RuntimeError::StackOverflow);
+        }
+
         if let Some(value) = self.call_builtin(name, &args)? {
             return Ok(value);
         }
@@ -233,7 +310,7 @@ impl Interpreter {
             .functions
             .get(name)
             .cloned()
-            .ok_or_else(|| RuntimeError::message(format!("undefined function {}", name)))?;
+            .ok_or_else(|| RuntimeError::message(format!("undefined function '{}'", name)))?;
         let layout = self
             .local_layouts
             .get(name)
@@ -264,6 +341,9 @@ impl Interpreter {
             }
         }
 
+        if self.trace_exec {
+            self.trace(&format!("CALL {}({} args)", name, args.len()));
+        }
         if self.debug_memory {
             eprintln!(
                 "[DEBUG] call {} (nargs={}, frame_depth={})",
@@ -277,15 +357,22 @@ impl Interpreter {
         let flow = self.exec_stmt(&function.body);
         self.frames.pop();
 
-        match flow? {
+        let result = match flow? {
             ControlFlow::Return(value) => Ok(value),
             ControlFlow::Next => Ok(BValue(0)),
             ControlFlow::Break => Ok(BValue(0)),
-            ControlFlow::Goto(label) => Err(RuntimeError::message(format!(
-                "unresolved goto label {}",
-                label
-            ))),
+            ControlFlow::Goto(label) => Err(RuntimeError::InvalidGoto(label)),
+        };
+
+        if self.trace_exec {
+            let val_str = match &result {
+                Ok(v) => v.0.to_string(),
+                Err(e) => format!("ERR({})", e),
+            };
+            self.trace(&format!("RETURN {} (from {})", val_str, name));
         }
+
+        result
     }
 
     // -------------------------------------------------------------------------
@@ -329,7 +416,12 @@ impl Interpreter {
                 };
                 Ok(ControlFlow::Return(value))
             }
-            Stmt::Goto(label) => Ok(ControlFlow::Goto(label.clone())),
+            Stmt::Goto(label) => {
+                if self.trace_exec {
+                    self.trace(&format!("GOTO {}", label));
+                }
+                Ok(ControlFlow::Goto(label.clone()))
+            }
             Stmt::Expr(expr) => {
                 self.eval_expr(expr)?;
                 Ok(ControlFlow::Next)
@@ -341,6 +433,7 @@ impl Interpreter {
     }
 
     fn exec_compound(&mut self, stmts: &[Stmt]) -> Result<ControlFlow, RuntimeError> {
+        // Pre-scan labels so goto can resolve forward references within this block.
         let mut label_map = HashMap::new();
         for (idx, stmt) in stmts.iter().enumerate() {
             if let Stmt::Label(name, _) = stmt {
@@ -356,9 +449,13 @@ impl Interpreter {
                 ControlFlow::Break => return Ok(ControlFlow::Break),
                 ControlFlow::Return(value) => return Ok(ControlFlow::Return(value)),
                 ControlFlow::Goto(label) => {
-                    if let Some(target) = label_map.get(&label) {
-                        index = *target;
+                    if let Some(&target) = label_map.get(&label) {
+                        if self.trace_exec {
+                            self.trace(&format!("RESOLVED goto {} -> stmt[{}]", label, target));
+                        }
+                        index = target;
                     } else {
+                        // Propagate to an outer compound block or function handler.
                         return Ok(ControlFlow::Goto(label));
                     }
                 }
@@ -373,11 +470,12 @@ impl Interpreter {
             Stmt::Compound(stmts) => stmts.as_slice(),
             _ => {
                 return Err(RuntimeError::message(
-                    "switch body must be compound statement",
+                    "switch body must be a compound statement",
                 ))
             }
         };
 
+        // Linear scan for the matching case or default.
         let mut default_index = None;
         let mut start_index = None;
         for (idx, stmt) in stmts.iter().enumerate() {
@@ -386,20 +484,19 @@ impl Interpreter {
                     start_index = Some(idx);
                     break;
                 }
-                Stmt::Default(_) => {
-                    if default_index.is_none() {
-                        default_index = Some(idx);
-                    }
+                Stmt::Default(_) if default_index.is_none() => {
+                    default_index = Some(idx);
                 }
                 _ => {}
             }
         }
 
         let mut index = match start_index.or(default_index) {
-            Some(index) => index,
+            Some(idx) => idx,
             None => return Ok(ControlFlow::Next),
         };
 
+        // Execute from the matched position, falling through until break/end.
         while index < stmts.len() {
             let stmt = &stmts[index];
             let current = match stmt {
@@ -410,7 +507,7 @@ impl Interpreter {
             match self.exec_stmt(current)? {
                 ControlFlow::Next => index += 1,
                 ControlFlow::Break => return Ok(ControlFlow::Next),
-                ControlFlow::Return(value) => return Ok(ControlFlow::Return(value)),
+                ControlFlow::Return(v) => return Ok(ControlFlow::Return(v)),
                 ControlFlow::Goto(label) => return Ok(ControlFlow::Goto(label)),
             }
         }
@@ -436,13 +533,7 @@ impl Interpreter {
                 let value = self.eval_expr(expr)?.as_i64();
                 let result = match op {
                     UnaryOp::Neg => -value,
-                    UnaryOp::Not => {
-                        if value == 0 {
-                            1
-                        } else {
-                            0
-                        }
-                    }
+                    UnaryOp::Not => (value == 0) as i64,
                     UnaryOp::BitNot => !value,
                 };
                 Ok(BValue(result))
@@ -515,21 +606,22 @@ impl Interpreter {
         right: &Expr,
     ) -> Result<BValue, RuntimeError> {
         match op {
+            // Short-circuit operators.
             BinaryOp::And => {
-                let left_val = self.eval_expr(left)?.as_i64();
-                if left_val == 0 {
+                let lv = self.eval_expr(left)?.as_i64();
+                if lv == 0 {
                     return Ok(BValue(0));
                 }
-                let right_val = self.eval_expr(right)?.as_i64();
-                Ok(BValue(if right_val == 0 { 0 } else { 1 }))
+                let rv = self.eval_expr(right)?.as_i64();
+                Ok(BValue((rv != 0) as i64))
             }
             BinaryOp::Or => {
-                let left_val = self.eval_expr(left)?.as_i64();
-                if left_val != 0 {
+                let lv = self.eval_expr(left)?.as_i64();
+                if lv != 0 {
                     return Ok(BValue(1));
                 }
-                let right_val = self.eval_expr(right)?.as_i64();
-                Ok(BValue(if right_val == 0 { 0 } else { 1 }))
+                let rv = self.eval_expr(right)?.as_i64();
+                Ok(BValue((rv != 0) as i64))
             }
             _ => {
                 let lhs = self.eval_expr(left)?.as_i64();
@@ -546,18 +638,18 @@ impl Interpreter {
             BinaryOp::Mul => lhs * rhs,
             BinaryOp::Div => {
                 if rhs == 0 {
-                    return Err(RuntimeError::message("division by zero"));
+                    return Err(RuntimeError::DivisionByZero);
                 }
                 lhs / rhs
             }
             BinaryOp::Rem => {
                 if rhs == 0 {
-                    return Err(RuntimeError::message("division by zero"));
+                    return Err(RuntimeError::DivisionByZero);
                 }
                 lhs % rhs
             }
-            BinaryOp::LShift => lhs << rhs,
-            BinaryOp::RShift => lhs >> rhs,
+            BinaryOp::LShift => lhs << (rhs & 63),
+            BinaryOp::RShift => lhs >> (rhs & 63),
             BinaryOp::Lt => (lhs < rhs) as i64,
             BinaryOp::Le => (lhs <= rhs) as i64,
             BinaryOp::Gt => (lhs > rhs) as i64,
@@ -590,7 +682,7 @@ impl Interpreter {
     }
 
     fn resolve_var_address(&mut self, name: &str) -> Result<i64, RuntimeError> {
-        // Check current frame's local layout first.
+        // Local symbols take priority over globals.
         if let Some(frame) = self.frames.last() {
             if let Some(layout) = self.local_layouts.get(&frame.func) {
                 if let Some(symbol) = layout.symbols.get(name) {
@@ -598,7 +690,6 @@ impl Interpreter {
                 }
             }
         }
-
         let slot = self.get_or_create_global(name);
         Ok(encode_global(slot))
     }
@@ -620,60 +711,61 @@ impl Interpreter {
     }
 
     // -------------------------------------------------------------------------
-    // Unified memory read / write layer
+    // Unified memory read / write
     // -------------------------------------------------------------------------
 
     fn load_address(&mut self, addr: i64) -> Result<BValue, RuntimeError> {
         if addr < 0 {
-            return Err(RuntimeError::message(format!(
-                "invalid address: {}",
-                addr
-            )));
+            return Err(RuntimeError::InvalidMemoryAccess(addr));
         }
-        match decode_address(addr) {
+        let value = match decode_address(addr) {
             Address::Local(index) => {
                 let frame = self
                     .frames
                     .last()
-                    .ok_or_else(|| RuntimeError::message("no frame"))?;
+                    .ok_or_else(|| RuntimeError::message("load from local with no frame"))?;
                 frame
                     .locals
                     .get(index)
                     .copied()
-                    .ok_or_else(|| RuntimeError::message("local address out of range"))
+                    .ok_or(RuntimeError::InvalidMemoryAccess(addr))?
             }
             Address::Heap(index) => self
                 .heap
                 .data
                 .get(index)
                 .copied()
-                .ok_or_else(|| RuntimeError::message("heap address out of range")),
+                .ok_or(RuntimeError::InvalidMemoryAccess(addr))?,
             Address::Global(index) => self
                 .globals
                 .data
                 .get(index)
                 .copied()
-                .ok_or_else(|| RuntimeError::message("global address out of range")),
+                .ok_or(RuntimeError::InvalidMemoryAccess(addr))?,
+        };
+        if self.strict_memory {
+            self.mem_trace("READ ", addr, value);
         }
+        Ok(value)
     }
 
     fn store_address(&mut self, addr: i64, value: BValue) -> Result<(), RuntimeError> {
         if addr < 0 {
-            return Err(RuntimeError::message(format!(
-                "invalid address: {}",
-                addr
-            )));
+            return Err(RuntimeError::InvalidMemoryAccess(addr));
+        }
+        if self.strict_memory {
+            self.mem_trace("WRITE", addr, value);
         }
         match decode_address(addr) {
             Address::Local(index) => {
                 let frame = self
                     .frames
                     .last_mut()
-                    .ok_or_else(|| RuntimeError::message("no frame"))?;
+                    .ok_or_else(|| RuntimeError::message("store to local with no frame"))?;
                 let slot = frame
                     .locals
                     .get_mut(index)
-                    .ok_or_else(|| RuntimeError::message("local address out of range"))?;
+                    .ok_or(RuntimeError::InvalidMemoryAccess(addr))?;
                 *slot = value;
                 Ok(())
             }
@@ -682,7 +774,7 @@ impl Interpreter {
                     .heap
                     .data
                     .get_mut(index)
-                    .ok_or_else(|| RuntimeError::message("heap address out of range"))?;
+                    .ok_or(RuntimeError::InvalidMemoryAccess(addr))?;
                 *slot = value;
                 Ok(())
             }
@@ -691,7 +783,7 @@ impl Interpreter {
                     .globals
                     .data
                     .get_mut(index)
-                    .ok_or_else(|| RuntimeError::message("global address out of range"))?;
+                    .ok_or(RuntimeError::InvalidMemoryAccess(addr))?;
                 *slot = value;
                 Ok(())
             }
@@ -699,12 +791,12 @@ impl Interpreter {
     }
 
     // -------------------------------------------------------------------------
-    // String interning — literals are stored in the heap
+    // String interning — literals are placed in the heap at parse time.
     // -------------------------------------------------------------------------
 
     fn intern_string(&mut self, value: &str) -> Result<i64, RuntimeError> {
-        if let Some(addr) = self.string_pool.get(value) {
-            return Ok(*addr);
+        if let Some(&addr) = self.string_pool.get(value) {
+            return Ok(addr);
         }
         let base = self.heap.allocate(value.len() + 1);
         for (idx, byte) in value.bytes().enumerate() {
@@ -718,102 +810,123 @@ impl Interpreter {
 
     // -------------------------------------------------------------------------
     // Built-in functions
+    //
+    // All builtins share the interface:
+    //   fn(&mut Interpreter, &[BValue]) -> Result<Option<BValue>, RuntimeError>
+    //
+    // Returning Ok(None) means "not a builtin" — the caller will then look for
+    // a user-defined function with that name.
     // -------------------------------------------------------------------------
 
-    fn call_builtin(&mut self, name: &str, args: &[BValue]) -> Result<Option<BValue>, RuntimeError> {
+    fn call_builtin(
+        &mut self,
+        name: &str,
+        args: &[BValue],
+    ) -> Result<Option<BValue>, RuntimeError> {
+        // Math registry takes precedence — copy the pointer to avoid borrow issues.
+        if let Some(math_fn) = self.math_registry.get(name).copied() {
+            return Ok(Some(math_fn(args, self.strict_math)));
+        }
+
         match name {
             "getchar" => {
                 let mut buf = [0_u8; 1];
-                let size = self
+                let n = self
                     .input
                     .read(&mut buf)
-                    .map_err(|err| RuntimeError::message(err.to_string()))?;
-                let value = if size == 0 { -1 } else { buf[0] as i64 };
+                    .map_err(|e| RuntimeError::message(e.to_string()))?;
+                let value = if n == 0 { -1 } else { buf[0] as i64 };
                 Ok(Some(BValue(value)))
             }
+
             "putchar" => {
-                let value = args.get(0).copied().unwrap_or(BValue(0));
-                let ch = (value.as_i64() & 0xFF) as u8;
+                let ch = (args.first().copied().unwrap_or(BValue(0)).as_i64() & 0xFF) as u8;
                 self.output.write_all(&[ch])?;
                 self.output.flush()?;
-                Ok(Some(value))
+                Ok(Some(BValue(ch as i64)))
             }
+
             "putnumbs" => {
-                let value = args.get(0).copied().unwrap_or(BValue(0)).as_i64();
-                self.output.write_all(value.to_string().as_bytes())?;
-                Ok(Some(BValue(value)))
+                let n = args.first().copied().unwrap_or(BValue(0)).as_i64();
+                self.output.write_all(n.to_string().as_bytes())?;
+                Ok(Some(BValue(n)))
             }
+
             "printf" => {
                 let fmt_addr = args
-                    .get(0)
+                    .first()
                     .copied()
-                    .ok_or_else(|| RuntimeError::message("printf requires format"))?
+                    .ok_or_else(|| RuntimeError::message("printf: missing format argument"))?
                     .as_i64();
                 let fmt = self.read_c_string(fmt_addr)?;
-                let mut output = Vec::new();
-                let mut arg_index = 1;
+                let mut out = Vec::new();
+                let mut arg_idx = 1usize;
                 let mut iter = fmt.iter().copied();
                 while let Some(ch) = iter.next() {
                     if ch != b'%' {
-                        output.push(ch);
+                        out.push(ch);
                         continue;
                     }
                     match iter.next() {
-                        Some(b'%') => output.push(b'%'),
+                        Some(b'%') => out.push(b'%'),
                         Some(b'd') => {
-                            let value = args.get(arg_index).copied().unwrap_or(BValue(0));
-                            arg_index += 1;
-                            output.extend_from_slice(value.as_i64().to_string().as_bytes());
+                            let v = args.get(arg_idx).copied().unwrap_or(BValue(0));
+                            arg_idx += 1;
+                            out.extend_from_slice(v.as_i64().to_string().as_bytes());
                         }
                         Some(b'o') => {
-                            let value = args.get(arg_index).copied().unwrap_or(BValue(0));
-                            arg_index += 1;
-                            output.extend_from_slice(
-                                format!("{:o}", value.as_i64()).as_bytes(),
-                            );
+                            let v = args.get(arg_idx).copied().unwrap_or(BValue(0));
+                            arg_idx += 1;
+                            out.extend_from_slice(format!("{:o}", v.as_i64()).as_bytes());
                         }
                         Some(b'c') => {
-                            let value = args.get(arg_index).copied().unwrap_or(BValue(0));
-                            arg_index += 1;
-                            output.push((value.as_i64() & 0xFF) as u8);
+                            let v = args.get(arg_idx).copied().unwrap_or(BValue(0));
+                            arg_idx += 1;
+                            out.push((v.as_i64() & 0xFF) as u8);
                         }
                         Some(b's') => {
-                            let addr = args.get(arg_index).copied().unwrap_or(BValue(0));
-                            arg_index += 1;
+                            let addr = args.get(arg_idx).copied().unwrap_or(BValue(0));
+                            arg_idx += 1;
                             let bytes = self.read_c_string(addr.as_i64())?;
-                            output.extend_from_slice(&bytes);
+                            out.extend_from_slice(&bytes);
                         }
-                        Some(other) => output.push(other),
+                        Some(other) => {
+                            out.push(b'%');
+                            out.push(other);
+                        }
                         None => break,
                     }
                 }
-                self.output.write_all(&output)?;
-                Ok(Some(BValue(output.len() as i64)))
+                self.output.write_all(&out)?;
+                Ok(Some(BValue(out.len() as i64)))
             }
+
             "char" => {
-                let addr = args.get(0).copied().unwrap_or(BValue(0)).as_i64();
-                let index = args.get(1).copied().unwrap_or(BValue(0)).as_i64();
-                let value = self.load_address(add_offset(addr, index))?;
+                let addr = args.first().copied().unwrap_or(BValue(0)).as_i64();
+                let idx = args.get(1).copied().unwrap_or(BValue(0)).as_i64();
+                let value = self.load_address(add_offset(addr, idx))?;
                 Ok(Some(value))
             }
+
             "lchar" => {
-                let addr = args.get(0).copied().unwrap_or(BValue(0)).as_i64();
-                let index = args.get(1).copied().unwrap_or(BValue(0)).as_i64();
+                let addr = args.first().copied().unwrap_or(BValue(0)).as_i64();
+                let idx = args.get(1).copied().unwrap_or(BValue(0)).as_i64();
                 let value = args.get(2).copied().unwrap_or(BValue(0));
-                self.store_address(add_offset(addr, index), value)?;
+                self.store_address(add_offset(addr, idx), value)?;
                 Ok(Some(value))
             }
+
             "getstr" => {
-                let addr = args.get(0).copied().unwrap_or(BValue(0)).as_i64();
+                let addr = args.first().copied().unwrap_or(BValue(0)).as_i64();
                 let mut line = String::new();
                 self.input
                     .read_line(&mut line)
-                    .map_err(|err| RuntimeError::message(err.to_string()))?;
+                    .map_err(|e| RuntimeError::message(e.to_string()))?;
                 while line.ends_with('\n') || line.ends_with('\r') {
                     line.pop();
                 }
-                for (idx, byte) in line.bytes().enumerate() {
-                    self.store_address(add_offset(addr, idx as i64), BValue(byte as i64))?;
+                for (i, byte) in line.bytes().enumerate() {
+                    self.store_address(add_offset(addr, i as i64), BValue(byte as i64))?;
                 }
                 self.store_address(
                     add_offset(addr, line.len() as i64),
@@ -821,18 +934,20 @@ impl Interpreter {
                 )?;
                 Ok(Some(BValue(addr)))
             }
+
             "putstr" => {
-                let addr = args.get(0).copied().unwrap_or(BValue(0)).as_i64();
+                let addr = args.first().copied().unwrap_or(BValue(0)).as_i64();
                 let bytes = self.read_c_string(addr)?;
                 self.output.write_all(&bytes)?;
                 Ok(Some(BValue(addr)))
             }
+
             "concat" => {
-                let dest = args.get(0).copied().unwrap_or(BValue(0)).as_i64();
+                let dest = args.first().copied().unwrap_or(BValue(0)).as_i64();
                 let mut offset = 0i64;
                 for arg in args.iter().skip(1) {
-                    let addr = arg.as_i64();
-                    let bytes = self.read_c_string(addr)?;
+                    let src_addr = arg.as_i64();
+                    let bytes = self.read_c_string(src_addr)?;
                     for byte in bytes {
                         self.store_address(add_offset(dest, offset), BValue(byte as i64))?;
                         offset += 1;
@@ -841,28 +956,38 @@ impl Interpreter {
                 self.store_address(add_offset(dest, offset), BValue(STRING_TERMINATOR))?;
                 Ok(Some(BValue(dest)))
             }
+
             "getvec" => {
-                // Allocate a heap vector of the requested size; return base address.
-                let size = args.get(0).copied().unwrap_or(BValue(0)).as_i64() as usize;
+                let size = args.first().copied().unwrap_or(BValue(0)).as_i64() as usize;
                 let base = self.heap.allocate(size + 1);
                 Ok(Some(BValue(encode_heap(base))))
             }
+
             "rlsvec" => {
-                // Bump allocator; release is a no-op for MVP.
+                // Bump allocator — release is a no-op for MVP.
                 Ok(Some(BValue(0)))
             }
+
             "nargs" => {
                 let count = self.frames.last().map(|f| f.nargs).unwrap_or(0);
                 Ok(Some(BValue(count as i64)))
             }
-            "exit" => Err(RuntimeError::Exit(0)),
+
+            "exit" => {
+                let code = args.first().copied().unwrap_or(BValue(0)).as_i64();
+                Err(RuntimeError::Exit(code))
+            }
+
+            // Stubbed I/O / system functions — return 0 silently.
             "openr" | "openw" | "flush" | "reread" | "system" | "getarg" => {
                 Ok(Some(BValue(0)))
             }
+
             _ => Ok(None),
         }
     }
 
+    /// Walk a B-string (terminated by `STRING_TERMINATOR`) and collect raw bytes.
     fn read_c_string(&mut self, addr: i64) -> Result<Vec<u8>, RuntimeError> {
         let mut bytes = Vec::new();
         let mut offset = 0i64;
@@ -873,10 +998,17 @@ impl Interpreter {
             }
             bytes.push((value & 0xFF) as u8);
             offset += 1;
+            if offset > 65536 {
+                return Err(RuntimeError::message("string read exceeded safety limit"));
+            }
         }
         Ok(bytes)
     }
 }
+
+// ---------------------------------------------------------------------------
+// Internal control-flow signal
+// ---------------------------------------------------------------------------
 
 #[derive(Clone, Debug)]
 enum ControlFlow {
