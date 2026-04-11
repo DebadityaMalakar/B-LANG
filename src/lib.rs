@@ -7,4 +7,5 @@ pub mod libraries;
 pub mod math;
 pub mod memory;
 pub mod parser;
+pub mod string_lib;
 pub mod symbol;

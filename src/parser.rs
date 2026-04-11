@@ -27,21 +27,48 @@ impl Parser {
 
     fn parse_program(&mut self) -> Result<Program, Error> {
         let mut includes = Vec::new();
+        let mut use_namespaces = Vec::new();
         let mut globals = Vec::new();
         let mut functions = Vec::new();
+        // Once a function or external def has been seen, includes and
+        // `use namespace` are no longer allowed.
+        let mut defs_started = false;
 
         while !self.is_eof() {
-            if self.match_keyword(Keyword::Include) {
+            // include <name>
+            if self.check_keyword(Keyword::Include) {
+                if defs_started {
+                    return Err(self.error_here(
+                        "'include' must precede all function and external definitions",
+                    ));
+                }
+                self.advance();
                 let name = self.expect_ident()?;
                 includes.push(name);
                 continue;
             }
 
+            // use namespace <name>
+            if self.check_keyword(Keyword::Use) {
+                if defs_started {
+                    return Err(self.error_here(
+                        "'use namespace' must precede function definitions",
+                    ));
+                }
+                self.advance(); // consume 'use'
+                self.expect_keyword(Keyword::Namespace)?;
+                let name = self.expect_ident()?;
+                use_namespaces.push(name);
+                continue;
+            }
+
             if self.match_keyword(Keyword::Extrn) {
+                defs_started = true;
                 self.parse_extrn_decl(&mut globals)?;
                 continue;
             }
 
+            defs_started = true;
             let name = self.expect_ident()?;
             if self.match_symbol(Symbol::LParen) {
                 let func = self.parse_function(name)?;
@@ -52,7 +79,7 @@ impl Parser {
             }
         }
 
-        Ok(Program { includes, globals, functions })
+        Ok(Program { includes, use_namespaces, globals, functions })
     }
 
     fn parse_global_decl(&mut self, name: String) -> Result<GlobalDecl, Error> {
@@ -150,6 +177,9 @@ impl Parser {
     fn parse_stmt(&mut self) -> Result<Stmt, Error> {
         if self.check_keyword(Keyword::Include) {
             return Err(self.error_here("'include' is not valid inside a function body"));
+        }
+        if self.check_keyword(Keyword::Use) {
+            return Err(self.error_here("'use namespace' is not valid inside a function body"));
         }
 
         if self.match_symbol(Symbol::LBrace) {
@@ -487,6 +517,12 @@ impl Parser {
             }
             TokenKind::Ident(name) => {
                 self.advance();
+                // Handle `lib::fn` namespace-qualified names.
+                if self.match_symbol(Symbol::ColonColon) {
+                    let member = self.expect_ident()?;
+                    let qualified = format!("{}::{}", name, member);
+                    return Ok(Expr::Var(qualified));
+                }
                 Ok(Expr::Var(name))
             }
             TokenKind::Symbol(Symbol::LParen) => {
@@ -539,7 +575,7 @@ impl Parser {
     fn peek_next_symbol(&self, symbol: Symbol) -> bool {
         if let Some(token) = self.tokens.get(self.index + 1) {
             if let TokenKind::Symbol(sym) = &token.kind {
-                return sym == &symbol;
+                return *sym == symbol;
             }
         }
         false
@@ -564,7 +600,7 @@ impl Parser {
     }
 
     fn check_keyword(&self, keyword: Keyword) -> bool {
-        matches!(&self.peek().kind, TokenKind::Keyword(key) if key == &keyword)
+        matches!(&self.peek().kind, TokenKind::Keyword(key) if *key == keyword)
     }
 
     fn expect_ident(&mut self) -> Result<String, Error> {

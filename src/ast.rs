@@ -3,6 +3,9 @@ pub struct Program {
     /// Library names requested via `include <name>` at the top level.
     /// Resolved by the interpreter before `main` is called.
     pub includes: Vec<String>,
+    /// Namespaces activated via `use namespace <name>` — must follow their
+    /// matching `include` and precede all function/external definitions.
+    pub use_namespaces: Vec<String>,
     pub globals: Vec<GlobalDecl>,
     pub functions: Vec<Function>,
 }

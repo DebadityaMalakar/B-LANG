@@ -196,3 +196,107 @@ fn math_rng_deterministic() {
 fn math_edge_cases() {
     assert_eq!(run_program("tests/programs/math_edge.b"), "0 0");
 }
+
+// ---------------------------------------------------------------------------
+// Phase 5: include / use namespace system
+// ---------------------------------------------------------------------------
+
+#[test]
+fn use_namespace_basic() {
+    // strlen works as a bare name after use namespace string
+    assert_eq!(run_program("tests/programs/use_namespace_basic.b"), "5");
+}
+
+#[test]
+fn string_namespaced_call_works() {
+    // string::strlen works without use namespace
+    assert_eq!(run_program("tests/programs/string_namespaced_call.b"), "5");
+}
+
+#[test]
+fn use_namespace_without_include_errors() {
+    // use namespace string without include string must fail before main runs
+    let err = run_program_err("tests/programs/use_namespace_no_include.b");
+    match &err {
+        b_lang::error::RuntimeError::Message(msg) => {
+            assert!(
+                msg.contains("has not been included"),
+                "wrong error message: {}",
+                msg
+            );
+        }
+        other => panic!("expected Message error, got {:?}", other),
+    }
+}
+
+#[test]
+fn string_include_guard() {
+    // Double include is silently skipped — strlen still returns 2
+    assert_eq!(run_program("tests/programs/string_include_guard.b"), "2");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: string inspection
+// ---------------------------------------------------------------------------
+
+#[test]
+fn string_inspection_functions() {
+    // strlen, strcmp, startswith, endswith, indexof, count
+    assert_eq!(
+        run_program("tests/programs/string_inspection.b"),
+        "5 0 1 1 2 2"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: case conversion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn string_case_conversion() {
+    // tocamel, tosnake, totitle
+    assert_eq!(
+        run_program("tests/programs/string_case.b"),
+        "helloWorld hello_world Hello World"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: trim and pad
+// ---------------------------------------------------------------------------
+
+#[test]
+fn string_trim_and_pad() {
+    // strip removes whitespace; lpad left-pads to width
+    assert_eq!(run_program("tests/programs/string_trim_pad.b"), "hello 00042");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: repetition and substr
+// ---------------------------------------------------------------------------
+
+#[test]
+fn string_repeat_and_substr() {
+    assert_eq!(run_program("tests/programs/string_repeat_substr.b"), "ababab ell");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: number conversion
+// ---------------------------------------------------------------------------
+
+#[test]
+fn string_number_conversion() {
+    assert_eq!(run_program("tests/programs/string_numconv.b"), "255 ff 10 123");
+}
+
+// ---------------------------------------------------------------------------
+// Phase 5: character classification
+// ---------------------------------------------------------------------------
+
+#[test]
+fn string_classification_functions() {
+    assert_eq!(
+        run_program("tests/programs/string_classification.b"),
+        "1 0 1 1 1 1"
+    );
+}

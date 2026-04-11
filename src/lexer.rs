@@ -14,6 +14,8 @@ pub enum Keyword {
     Return,
     Goto,
     Include,
+    Use,
+    Namespace,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -53,6 +55,7 @@ pub enum Symbol {
     MinusMinus,
     Question,
     Colon,
+    ColonColon,
     Comma,
     Semi,
     LParen,
@@ -139,6 +142,8 @@ impl Lexer {
                 "return" => TokenKind::Keyword(Keyword::Return),
                 "goto" => TokenKind::Keyword(Keyword::Goto),
                 "include" => TokenKind::Keyword(Keyword::Include),
+                "use" => TokenKind::Keyword(Keyword::Use),
+                "namespace" => TokenKind::Keyword(Keyword::Namespace),
                 _ => TokenKind::Ident(ident),
             };
             return Ok(Token { kind, location });
@@ -517,7 +522,12 @@ impl Lexer {
             }
             ':' => {
                 self.advance_char();
-                Symbol::Colon
+                if self.peek_char() == Some(':') {
+                    self.advance_char();
+                    Symbol::ColonColon
+                } else {
+                    Symbol::Colon
+                }
             }
             ',' => {
                 self.advance_char();

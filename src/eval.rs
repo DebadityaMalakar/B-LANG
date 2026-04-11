@@ -7,8 +7,9 @@ use crate::memory::{
     add_offset, decode_address, encode_global, encode_heap, encode_local, Address, BValue, Frame,
     GlobalMemory, Heap,
 };
+use crate::string_lib::StringBuiltinFn;
 use crate::symbol::{GlobalSymbol, LocalLayout, LocalSymbol};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufWriter, Read, Write};
 
 /// Maximum call-stack depth before `StackOverflow` is raised.
@@ -70,9 +71,13 @@ pub struct Interpreter {
     input: Box<dyn BufRead>,
     output: OutputSink,
     string_pool: HashMap<String, i64>,
-    /// Registry of math (and future library) builtins populated by `include`.
+    /// Registry of math builtins (bare + prefixed) populated by `include math`.
     math_registry: HashMap<String, MathFn>,
-    /// Deferred error from a failed `include` resolution; surfaced in run_main.
+    /// Registry of string builtins populated by `include string`.
+    /// Prefixed names (`string::fn`) are always present after include.
+    /// Bare names (`fn`) are added when `use namespace string` is declared.
+    string_registry: HashMap<String, StringBuiltinFn>,
+    /// Deferred error from a failed `include` / `use namespace`; surfaced in run_main.
     include_error: Option<RuntimeError>,
     /// Emit heap/stack dumps and memory access warnings.
     debug_memory: bool,
@@ -105,14 +110,95 @@ impl Interpreter {
             .map(|f| (f.name.clone(), Self::build_local_layout(f)))
             .collect();
 
-        // Resolve includes — build the math registry in source order.
-        // An unknown library name captures an error to surface in run_main.
+        // ── Phase 5 include + use-namespace resolution ────────────────────
+        //
+        // Processing order:
+        //   1. Walk `program.includes` in source order.
+        //      - Skip duplicates (include guard).
+        //      - Detect circular includes (forward-looking infrastructure;
+        //        built-in libs cannot include each other, so this never fires
+        //        today but the Vec is in place for user-defined libs later).
+        //      - Merge math maps into math_registry (first-seen wins for bare names).
+        //      - Add string::* names to string_registry immediately.
+        //      - Store string bare-name maps in string_bare_by_lib for step 2.
+        //   2. Walk `program.use_namespaces` in source order.
+        //      - Validate that the named library was included; error if not.
+        //      - Activate bare names into string_registry (first-seen wins).
+        //
+        // Any error is captured in include_error and surfaced by run_main
+        // before executing the B program.
+
         let mut math_registry: HashMap<String, MathFn> = HashMap::new();
+        let mut string_registry: HashMap<String, StringBuiltinFn> = HashMap::new();
+        // Bare string maps saved per library name for later use-namespace activation.
+        let mut string_bare_by_lib: HashMap<String, HashMap<String, StringBuiltinFn>> =
+            HashMap::new();
+        let mut included: HashSet<String> = HashSet::new();
+        let mut include_stack: Vec<String> = Vec::new();
         let mut include_error: Option<RuntimeError> = None;
+
         for lib_name in &program.includes {
-            if let Err(e) = resolve_include(lib_name, &mut math_registry) {
-                include_error = Some(e);
+            // Include guard: skip silently if already registered.
+            if included.contains(lib_name) {
+                continue;
+            }
+            // Circular detection: should never fire for built-in libs, but
+            // the infrastructure must exist for Phase 6+ user libs.
+            if include_stack.contains(lib_name) {
+                let cycle = format!("{} -> {}", include_stack.join(" -> "), lib_name);
+                eprintln!("[warning] circular include detected: {}", cycle);
+                include_error = Some(RuntimeError::message(format!(
+                    "[warning] circular include detected: {}",
+                    cycle
+                )));
                 break;
+            }
+            include_stack.push(lib_name.clone());
+            match resolve_include(lib_name) {
+                Ok(library) => {
+                    // Math: bare names always active (Phase 4 compat); first-seen wins.
+                    for (name, f) in &library.math_bare {
+                        math_registry.entry(name.clone()).or_insert(*f);
+                    }
+                    // Math: namespaced names (math::fn) always active.
+                    for (name, f) in &library.math_namespaced {
+                        math_registry.entry(name.clone()).or_insert(*f);
+                    }
+                    // String: prefixed names always active after include.
+                    for (name, f) in &library.string_namespaced {
+                        string_registry.entry(name.clone()).or_insert(*f);
+                    }
+                    // String: save bare map for use-namespace activation later.
+                    if !library.string_bare.is_empty() {
+                        string_bare_by_lib
+                            .insert(lib_name.clone(), library.string_bare);
+                    }
+                    included.insert(lib_name.clone());
+                }
+                Err(e) => {
+                    include_error = Some(e);
+                    break;
+                }
+            }
+            include_stack.pop();
+        }
+
+        // Step 2: activate bare names for each declared namespace.
+        if include_error.is_none() {
+            for ns_name in &program.use_namespaces {
+                if !included.contains(ns_name) {
+                    let msg = format!("[error] '{}' has not been included", ns_name);
+                    eprintln!("{}", msg);
+                    include_error = Some(RuntimeError::message(msg));
+                    break;
+                }
+                if let Some(bare_map) = string_bare_by_lib.get(ns_name) {
+                    for (name, f) in bare_map {
+                        // First-include-wins: don't overwrite a name already
+                        // activated by an earlier use namespace statement.
+                        string_registry.entry(name.clone()).or_insert(*f);
+                    }
+                }
             }
         }
 
@@ -127,6 +213,7 @@ impl Interpreter {
             output,
             string_pool: HashMap::new(),
             math_registry,
+            string_registry,
             include_error,
             debug_memory: false,
             trace_exec: false,
@@ -823,9 +910,13 @@ impl Interpreter {
         name: &str,
         args: &[BValue],
     ) -> Result<Option<BValue>, RuntimeError> {
-        // Math registry takes precedence — copy the pointer to avoid borrow issues.
+        // Math registry: copy pointer to avoid borrow conflicts.
         if let Some(math_fn) = self.math_registry.get(name).copied() {
             return Ok(Some(math_fn(args, self.strict_math)));
+        }
+        // String registry: string builtins need access to the raw heap data.
+        if let Some(str_fn) = self.string_registry.get(name).copied() {
+            return Ok(Some(str_fn(args, &mut self.heap.data, self.strict_math)));
         }
 
         match name {
